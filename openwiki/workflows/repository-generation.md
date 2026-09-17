@@ -13,6 +13,8 @@ tags:
     claims,
   ]
 sources:
+  - id: openwiki-source-8b316b2a9d744597bffd9c56
+    resource: repo://src/agent/repository-prompts.ts
   - id: openwiki-source-6cb3236b8c1412a26d832fcf
     resource: repo://src/agent/repository-runner.ts
   - id: openwiki-source-69abc6f0f641147820a274bc
@@ -35,10 +37,10 @@ sources:
     resource: repo://test/agent/repository-runner.test.ts
   - id: openwiki-source-77febf5d49f26cc2405db8dd
     resource: repo://test/generation/repository-run.test.ts
-generated: { by: "openwiki/0.4.3", at: "2026-08-30T10:21:48.925Z" }
+generated: { by: "openwiki/0.5.2", at: "2026-09-15T08:09:47.649Z" }
 verified:
-  - by: openwiki/0.4.3
-    at: 2026-08-30T10:21:48.925Z
+  - by: openwiki/0.5.2
+    at: 2026-09-15T08:09:47.649Z
 ---
 
 # Repository Generation Lifecycle
@@ -224,14 +226,32 @@ A `PageJobStatus` is one of `pending`, `skipped`, or `complete`. `skipped` is a
 third durable per-job status, distinct from `complete`, that records "this page
 was attempted, failed or abandoned, and was rolled back to its pre-worker state."
 
-The native runner skips a worker in two situations, both inside `runPageAgent`:
-the worker throws a non-fatal error before submitting, or the worker returns
-without having called `submit_page`. A fatal submission failure (an error from
-`submitRepositoryPage` that is not a correctable `invalid_input`) is rethrown
-rather than skipped, because it signals a durable-invariant violation the worker
-cannot correct. `submit_page` rejections with `invalid_input` are by design
-returned to the worker as failed tool results so its loop stays active; only a
-failure or a clean exit-without-submit triggers a skip.
+The native runner handles four failure modes inside `runPageAgent`, each of
+which preserves the per-job durability guarantee differently:
+
+1. **Non-fatal pre-submit error** — the worker throws a recoverable error before
+   calling `submit_page`. The catch block calls `skipRepositoryPage` with the
+   pre-worker snapshot, restoring the page and marking the job `skipped`.
+2. **Exit without submit** — the worker returns cleanly without ever calling
+   `submit_page` (for example, because the model stopped early). The post-loop
+   guard calls `skipRepositoryPage` with the snapshot, same as above.
+3. **Fatal pre-submit error** — a fatal submission failure (an error from
+   `submitRepositoryPage` that is not a correctable `invalid_input`) is rethrown
+   rather than skipped, because it signals a durable-invariant violation the
+   worker cannot correct. `submit_page` rejections with `invalid_input` are by
+   design returned to the worker as failed tool results so its loop stays active;
+   only a non-`invalid_input` failure triggers a rethrow.
+4. **Post-submit failure (durability guarantee)** — a worker that throws after
+   `submit_page` succeeds does NOT get rolled back. The `submitted` flag is set
+   before `submitRepositoryPage` returns, so the catch block checks
+   `if (submitted) return null;` and the post-loop guard does the same — neither
+   calls `skipRepositoryPage`, and the page stays durably complete. The page is
+   already a self-contained durability unit: its Claims were persisted and proven
+   durable by `assertPageClaimsDurable` before the job was marked `complete`, so a
+   later failure cannot undo that durability. The test "keeps a durably
+   completed page after a later worker failure" (the `pageWorkerPostSubmitFailures`
+   harness field) verifies that `restoreCalls` stays zero and the page's status
+   remains `complete`.
 
 ### Snapshot capture, skip, and restore
 
@@ -286,6 +306,33 @@ skipped or source changed during the finish window, finish writes `interrupted`
 metadata instead of `complete` metadata, and then removes `openwiki/.run.json`
 last as usual. The run therefore completes deterministically, but the persisted
 `interrupted` status tells a later `begin` that work remains.
+
+### Restamping only pages the run regenerated
+
+Finish does not restamp every surviving page with the run's own source checkpoint.
+Before finalization it reads the page manifest and builds `producerActorsByPage`
+keyed by the pages whose manifest entry records `completedRunId === run.state.runId`
+— that is, only the pages this run actually (re)completed. After Claims finalization
+and the whole-run durability proof, finish partitions the surviving page inventory
+into three sets:
+
+- **Regenerated pages** (`producerActorsByPage` keys) are restamped with this run's
+  source checkpoint — they earned new coverage by completing a job.
+- **Skipped pages** are restored from their snapshots and, like other excluded
+  pages, are not required to carry durable Claims; they keep their prior coverage.
+- **Untouched pages** — pages outside this run's plan, or already durable from an
+  earlier run — keep their prior source checkpoint via `preserveSourcePages`, so a
+  disjoint run that touched an unrelated page never advances a neighbor's baseline.
+
+`replaceRepositoryPageManifest` receives the run checkpoint for regenerated pages,
+the `skippedPages` set, and the `preserveSourcePages` set. For a preserved-source
+page it re-proves the final Markdown/Claims pair: if deterministic finalization
+rewrote code-owned metadata (for example, repaired a broken internal link) the entry
+refreshes its `pageVersion` to match the final durable bytes while keeping the prior
+`gitHead` and `sourceFingerprint`; if nothing changed the exact prior entry is
+retained. This is why a later `begin` sees the correct per-page update window: a
+page a run did not regenerate is not advanced to this run's baseline, so a
+subsequent update only re-evaluates it against its own prior checkpoint.
 
 ### Resume resets skipped jobs to pending
 
@@ -376,6 +423,10 @@ Claims sidecars for deleted pages, finalizes wiki artifacts (indexes and
 provenance), restores any skipped pages, finalizes Claims (excluding skipped
 pages), and proves the whole repository has no orphaned or partially durable
 Claims via `assertRepositoryClaimsDurable` (also excluding skipped pages). It
+then rebuilds the page manifest so that only pages this run actually regenerated
+are restamped with this run's source checkpoint, while skipped and untouched
+pages retain their prior checkpoint via `preserveSourcePages` (a
+deterministic-finalization rewrite still refreshes `pageVersion`). It
 then persists completion metadata — `interrupted` when any page was skipped or
 source changed during the finish window, otherwise `complete` — and, last of
 all, removes `openwiki/.run.json`. The checkpoint is deleted last on purpose:
@@ -412,6 +463,23 @@ and source-fingerprint invalidation semantics. The host adapter does not, howeve
 participate in skipped-page handling: it calls `finishRepositoryRun` without
 `skippedPageSnapshots`, so a skipped job in a host-driven run makes finish report
 the missing-snapshot `invalid_state` unless the host supplies snapshots itself.
+
+## Planner and worker prompts
+
+The native runner bounds the planning agent with `createRepositoryPlannerPrompt`,
+which builds the complete planner system prompt from the durable begin/resume
+view and any user/connector planning context. The prompt instructs the planner
+that its only output action is `submit_plan`: it must not write documentation,
+delegate work, or emit narrative or conversational text, and must invoke
+`submit_plan` directly. It directs the planner to explore the repository first —
+manifests, major directories, entrypoints, and public surfaces — then trace
+representative end-to-end flows and inspect focused tests before submitting the
+smallest complete information architecture. Update-specific context appends the
+committed per-page update windows and Claims requiring attention, so the planner
+can decide which pages actually need work. The page-worker prompt
+(`createRepositoryPagePrompt`) bounds each worker to exactly its assigned page,
+injects the sparse-Claim reconciliation guidance, and requires
+`submit_page` with canonical `repo://` evidence resources.
 
 ## Failure semantics
 

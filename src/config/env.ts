@@ -6,6 +6,8 @@ import {
   ANTHROPIC_BASE_URL_ENV_KEY,
   BASETEN_API_KEY_ENV_KEY,
   BASETEN_BASE_URL_ENV_KEY,
+  BOB_API_KEY_ENV_KEY,
+  BOB_BASE_URL_ENV_KEY,
   BEDROCK_AWS_ACCESS_KEY_ID_ENV_KEY,
   BEDROCK_AWS_REGION_ENV_KEY,
   BEDROCK_AWS_SECRET_ACCESS_KEY_ENV_KEY,
@@ -34,7 +36,9 @@ import {
   OPENAI_CHATGPT_REFRESH_TOKEN_ENV_KEY,
   OPENAI_COMPATIBLE_API_KEY_ENV_KEY,
   OPENAI_COMPATIBLE_BASE_URL_ENV_KEY,
+  OPENAI_COMPATIBLE_REASONING_EFFORT_SUPPORTED_ENV_KEY,
   OPENAI_COMPATIBLE_STREAMING_ENV_KEY,
+  OPENAI_COMPATIBLE_STREAM_MESSAGES_ENV_KEY,
   OPENAI_COMPATIBLE_USE_RESPONSES_API_ENV_KEY,
   OPENWIKI_GOOGLE_ACCESS_TOKEN_ENV_KEY,
   OPENWIKI_GOOGLE_CLIENT_ID_ENV_KEY,
@@ -101,6 +105,8 @@ export type CredentialDiagnostic = {
 export const MANAGED_ENV_KEYS = [
   BASETEN_API_KEY_ENV_KEY,
   BASETEN_BASE_URL_ENV_KEY,
+  BOB_API_KEY_ENV_KEY,
+  BOB_BASE_URL_ENV_KEY,
   COPILOT_API_KEY_ENV_KEY,
   COPILOT_BASE_URL_ENV_KEY,
   FIREWORKS_API_KEY_ENV_KEY,
@@ -119,7 +125,9 @@ export const MANAGED_ENV_KEYS = [
   OPENAI_COMPATIBLE_API_KEY_ENV_KEY,
   OPENAI_COMPATIBLE_BASE_URL_ENV_KEY,
   OPENAI_COMPATIBLE_STREAMING_ENV_KEY,
+  OPENAI_COMPATIBLE_STREAM_MESSAGES_ENV_KEY,
   OPENAI_COMPATIBLE_USE_RESPONSES_API_ENV_KEY,
+  OPENAI_COMPATIBLE_REASONING_EFFORT_SUPPORTED_ENV_KEY,
   ANTHROPIC_API_KEY_ENV_KEY,
   ANTHROPIC_BASE_URL_ENV_KEY,
   GEMINI_API_KEY_ENV_KEY,
@@ -413,7 +421,10 @@ function createCredentialDiagnostic(
                 : key === OPENWIKI_STREAM_IDLE_TIMEOUT_ENV_KEY
                   ? getStreamIdleTimeoutWarnings(value, provider)
                   : key === OPENAI_COMPATIBLE_USE_RESPONSES_API_ENV_KEY ||
-                      key === OPENAI_COMPATIBLE_STREAMING_ENV_KEY
+                      key === OPENAI_COMPATIBLE_STREAMING_ENV_KEY ||
+                      key === OPENAI_COMPATIBLE_STREAM_MESSAGES_ENV_KEY ||
+                      key ===
+                        OPENAI_COMPATIBLE_REASONING_EFFORT_SUPPORTED_ENV_KEY
                     ? getBooleanWarnings(value)
                     : key === OPENWIKI_PROVIDER_RETRY_ATTEMPTS_ENV_KEY
                       ? getRetryAttemptsWarnings(value)
@@ -455,6 +466,10 @@ function getBaseUrlDiagnosticWarnings(
     return getProviderBaseUrlWarnings("baseten", value);
   }
 
+  if (key === BOB_BASE_URL_ENV_KEY) {
+    return getProviderBaseUrlWarnings("bob", value);
+  }
+
   if (key === FIREWORKS_BASE_URL_ENV_KEY) {
     return getProviderBaseUrlWarnings("fireworks", value);
   }
@@ -487,8 +502,11 @@ function isNonSecretDiagnosticKey(key: string): boolean {
     key === OPENWIKI_OPENROUTER_PROVIDER_ONLY_ENV_KEY ||
     key === OPENAI_COMPATIBLE_USE_RESPONSES_API_ENV_KEY ||
     key === OPENAI_COMPATIBLE_STREAMING_ENV_KEY ||
+    key === OPENAI_COMPATIBLE_STREAM_MESSAGES_ENV_KEY ||
+    key === OPENAI_COMPATIBLE_REASONING_EFFORT_SUPPORTED_ENV_KEY ||
     key === ANTHROPIC_BASE_URL_ENV_KEY ||
     key === BASETEN_BASE_URL_ENV_KEY ||
+    key === BOB_BASE_URL_ENV_KEY ||
     key === COPILOT_BASE_URL_ENV_KEY ||
     key === FIREWORKS_BASE_URL_ENV_KEY ||
     key === NVIDIA_BASE_URL_ENV_KEY ||
@@ -501,12 +519,12 @@ function isNonSecretDiagnosticKey(key: string): boolean {
   );
 }
 
-function createCredentialPreview(value: string): string {
+export function createCredentialPreview(value: string): string {
   if (value.length <= 10) {
     return JSON.stringify("*".repeat(value.length));
   }
 
-  return JSON.stringify(`${value.slice(0, 6)}...${value.slice(-4)}`);
+  return JSON.stringify(`...${value.slice(-4)}`);
 }
 
 function getCredentialWarnings(value: string): string[] {
@@ -667,12 +685,27 @@ export function parseEnv(content: string): EnvMap {
 
 function parseEnvValue(value: string): string {
   if (value.startsWith('"') && value.endsWith('"')) {
-    return value
-      .slice(1, -1)
-      .replace(/\\n/gu, "\n")
-      .replace(/\\r/gu, "\r")
-      .replace(/\\"/gu, '"')
-      .replace(/\\\\/gu, "\\");
+    // A single left-to-right pass that consumes each backslash escape as one
+    // atomic unit. Sequential independent replace() calls (the previous
+    // implementation) are not safe here: unescaping "\\n" back into a raw
+    // backslash can produce a new "\<char>" pair that a later or earlier
+    // pass then misreads as its own escape sequence (e.g. a Windows path
+    // like "C:\name\creds.json" gets its "\\" + "name" read as "\n" +
+    // "ame", corrupting the value with a real newline).
+    return value.slice(1, -1).replace(/\\(.)/gsu, (match, escaped: string) => {
+      switch (escaped) {
+        case "n":
+          return "\n";
+        case "r":
+          return "\r";
+        case '"':
+          return '"';
+        case "\\":
+          return "\\";
+        default:
+          return match;
+      }
+    });
   }
 
   return value;
